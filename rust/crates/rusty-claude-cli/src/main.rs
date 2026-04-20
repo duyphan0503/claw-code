@@ -103,6 +103,8 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--allowedTools",
     "--allowed-tools",
     "--resume",
+    "--acp",
+    "-acp",
     "--print",
     "--compact",
     "--base-commit",
@@ -256,6 +258,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
+        CliAction::Acp { output_format } => print_acp_status(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Export {
@@ -345,6 +348,9 @@ enum CliAction {
     Doctor {
         output_format: CliOutputFormat,
     },
+    Acp {
+        output_format: CliOutputFormat,
+    },
     State {
         output_format: CliOutputFormat,
     },
@@ -376,6 +382,7 @@ enum LocalHelpTopic {
     Status,
     Sandbox,
     Doctor,
+    Acp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,11 +455,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
+                validate_model_syntax(value)?;
                 model = resolve_model_alias_with_config(value);
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias_with_config(&flag[8..]);
+                let value = &flag[8..];
+                validate_model_syntax(value)?;
+                model = resolve_model_alias_with_config(value);
                 index += 1;
             }
             "--output-format" => {
@@ -553,6 +563,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             flag if rest.is_empty() && flag.starts_with("--resume=") => {
                 rest.push("--resume".to_string());
                 rest.push(flag[9..].to_string());
+                index += 1;
+            }
+            "--acp" | "-acp" => {
+                rest.push("acp".to_string());
                 index += 1;
             }
             "--allowedTools" | "--allowed-tools" => {
@@ -669,6 +683,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "acp" => parse_acp_args(&rest[1..], output_format),
         "login" | "logout" => Err(removed_auth_surface_error(rest[0].as_str())),
         "init" => Ok(CliAction::Init { output_format }),
         "export" => parse_export_args(&rest[1..], output_format),
@@ -723,6 +738,7 @@ fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>>
         "status" => LocalHelpTopic::Status,
         "sandbox" => LocalHelpTopic::Sandbox,
         "doctor" => LocalHelpTopic::Doctor,
+        "acp" => LocalHelpTopic::Acp,
         _ => return None,
     };
     Some(Ok(CliAction::HelpTopic(topic)))
@@ -738,6 +754,31 @@ fn parse_single_word_command_alias(
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Diagnostic verbs (help, version, status, sandbox, doctor, state) accept only the verb itself
+    // or --help / -h as a suffix. Any other suffix args are unrecognized.
+    let verb = &rest[0];
+    let is_diagnostic = matches!(
+        verb.as_str(),
+        "help" | "version" | "status" | "sandbox" | "doctor" | "state"
+    );
+
+    if is_diagnostic && rest.len() > 1 {
+        // Diagnostic verb with trailing args: reject unrecognized suffix
+        if is_help_flag(&rest[1]) && rest.len() == 2 {
+            // "doctor --help" is valid, routed to parse_local_help_action() instead
+            return None;
+        }
+        // Unrecognized suffix like "--json"
+        return Some(Err(format!(
+            "unrecognized argument `{}` for subcommand `{}`",
+            rest[1], verb
+        )));
+    }
+
     if rest.len() != 1 {
         return None;
     }
@@ -791,6 +832,16 @@ fn removed_auth_surface_error(command_name: &str) -> String {
     format!(
         "`claw {command_name}` has been removed. Set ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN instead."
     )
+}
+
+fn parse_acp_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [] => Ok(CliAction::Acp { output_format }),
+        [subcommand] if subcommand == "serve" => Ok(CliAction::Acp { output_format }),
+        _ => Err(String::from(
+            "unsupported ACP invocation. Use `claw acp`, `claw acp serve`, `claw --acp`, or `claw -acp`.",
+        )),
+    }
 }
 
 fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
@@ -1018,6 +1069,37 @@ fn resolve_model_alias_with_config(model: &str) -> String {
         return resolve_model_alias(&resolved).to_string();
     }
     resolve_model_alias(trimmed).to_string()
+}
+
+/// Validate model syntax at parse time.
+/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
+/// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
+fn validate_model_syntax(model: &str) -> Result<(), String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err("model string cannot be empty".to_string());
+    }
+    // Known aliases are always valid
+    match trimmed {
+        "opus" | "sonnet" | "haiku" => return Ok(()),
+        _ => {}
+    }
+    // Check for spaces (malformed)
+    if trimmed.contains(' ') {
+        return Err(format!(
+            "invalid model syntax: '{}' contains spaces. Use provider/model format or known alias",
+            trimmed
+        ));
+    }
+    // Check provider/model format: provider_id/model_id
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(format!(
+            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
+            trimmed
+        ));
+    }
+    Ok(())
 }
 
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
@@ -5663,28 +5745,72 @@ fn sandbox_json_value(status: &runtime::SandboxStatus) -> serde_json::Value {
 fn render_help_topic(topic: LocalHelpTopic) -> String {
     match topic {
         LocalHelpTopic::Status => "Status
-  Usage            claw status
+  Usage            claw status [--output-format <format>]
   Purpose          show the local workspace snapshot without entering the REPL
   Output           model, permissions, git state, config files, and sandbox status
+  Formats          text (default), json
   Related          /status · claw --resume latest /status"
             .to_string(),
         LocalHelpTopic::Sandbox => "Sandbox
-  Usage            claw sandbox
+  Usage            claw sandbox [--output-format <format>]
   Purpose          inspect the resolved sandbox and isolation state for the current directory
   Output           namespace, network, filesystem, and fallback details
+  Formats          text (default), json
   Related          /sandbox · claw status"
             .to_string(),
         LocalHelpTopic::Doctor => "Doctor
-  Usage            claw doctor
+  Usage            claw doctor [--output-format <format>]
   Purpose          diagnose local auth, config, workspace, sandbox, and build metadata
   Output           local-only health report; no provider request or session resume required
+  Formats          text (default), json
   Related          /doctor · claw --resume latest /doctor"
+            .to_string(),
+        LocalHelpTopic::Acp => "ACP / Zed
+  Usage            claw acp [serve] [--output-format <format>]
+  Aliases          claw --acp · claw -acp
+  Purpose          explain the current editor-facing ACP/Zed launch contract without starting the runtime
+  Status           discoverability only; `serve` is a status alias and does not launch a daemon yet
+  Formats          text (default), json
+  Related          ROADMAP #64a (discoverability) · ROADMAP #76 (real ACP support) · claw --help"
             .to_string(),
     }
 }
 
 fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
+}
+
+fn print_acp_status(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let message = "ACP/Zed editor integration is not implemented in claw-code yet. `claw acp serve` is only a discoverability alias today; it does not launch a daemon or Zed-specific protocol endpoint. Use the normal terminal surfaces for now and track ROADMAP #76 for real ACP support.";
+    match output_format {
+        CliOutputFormat::Text => {
+            println!(
+                "ACP / Zed\n  Status           discoverability only\n  Launch           `claw acp serve` / `claw --acp` / `claw -acp` report status only; no editor daemon is available yet\n  Today            use `claw prompt`, the REPL, or `claw doctor` for local verification\n  Tracking         ROADMAP #76\n  Message          {message}"
+            );
+        }
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "kind": "acp",
+                    "status": "discoverability_only",
+                    "supported": false,
+                    "serve_alias_only": true,
+                    "message": message,
+                    "launch_command": serde_json::Value::Null,
+                    "aliases": ["acp", "--acp", "-acp"],
+                    "discoverability_tracking": "ROADMAP #64a",
+                    "tracking": "ROADMAP #76",
+                    "recommended_workflows": [
+                        "claw prompt TEXT",
+                        "claw",
+                        "claw doctor"
+                    ],
+                }))?
+            );
+        }
+    }
+    Ok(())
 }
 
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
@@ -8653,6 +8779,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
+    writeln!(out, "  claw acp [serve]")?;
+    writeln!(
+        out,
+        "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
+    )?;
     writeln!(out, "      Source of truth: {OFFICIAL_REPO_SLUG}")?;
     writeln!(
         out,
@@ -8858,6 +8989,7 @@ mod tests {
             request_id: Some("req_jobdori_789".to_string()),
             body: String::new(),
             retryable: true,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-22", &error);
@@ -8880,6 +9012,7 @@ mod tests {
                 request_id: Some("req_jobdori_790".to_string()),
                 body: String::new(),
                 retryable: true,
+                suggested_action: None,
             }),
         };
 
@@ -8955,6 +9088,7 @@ mod tests {
             request_id: Some("req_ctx_456".to_string()),
             body: String::new(),
             retryable: false,
+            suggested_action: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -8986,6 +9120,7 @@ mod tests {
                 request_id: Some("req_ctx_retry_789".to_string()),
                 body: String::new(),
                 retryable: false,
+                suggested_action: None,
             }),
         };
 
@@ -9718,6 +9853,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_acp_command_surfaces() {
+        assert_eq!(
+            parse_args(&["acp".to_string()]).expect("acp should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["acp".to_string(), "serve".to_string()]).expect("acp serve should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["--acp".to_string()]).expect("--acp should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&["-acp".to_string()]).expect("-acp should parse"),
+            CliAction::Acp {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+    }
+
+    #[test]
     fn local_command_help_flags_stay_on_the_local_parser_path() {
         assert_eq!(
             parse_args(&["status".to_string(), "--help".to_string()])
@@ -9733,6 +9896,10 @@ mod tests {
             parse_args(&["doctor".to_string(), "--help".to_string()])
                 .expect("doctor help should parse"),
             CliAction::HelpTopic(LocalHelpTopic::Doctor)
+        );
+        assert_eq!(
+            parse_args(&["acp".to_string(), "--help".to_string()]).expect("acp help should parse"),
+            CliAction::HelpTopic(LocalHelpTopic::Acp)
         );
     }
 
@@ -10651,6 +10818,7 @@ mod tests {
         assert!(help.contains("claw status"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
+        assert!(help.contains("claw acp [serve]"));
         assert!(help.contains("claw agents"));
         assert!(help.contains("claw mcp"));
         assert!(help.contains("claw skills"));
