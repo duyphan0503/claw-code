@@ -1072,40 +1072,55 @@ fn resolve_model_alias_with_config(model: &str) -> String {
 }
 
 /// Validate model syntax at parse time.
-/// Accepts: known aliases (opus, sonnet, haiku) or provider/model pattern.
-/// Rejects: empty, whitespace-only, strings with spaces, or invalid chars.
+/// Accepts common model IDs (e.g. `gpt-4o`, `qwen-max`, `qwen2.5-coder:7b`)
+/// and provider/model forms (e.g. `openai/gpt-4.1-mini`).
+/// Rejects empty values, whitespace, and unsupported characters.
 fn validate_model_syntax(model: &str) -> Result<(), String> {
     let trimmed = model.trim();
     if trimmed.is_empty() {
         return Err("model string cannot be empty".to_string());
     }
-    // Known aliases are always valid
-    match trimmed {
-        "opus" | "sonnet" | "haiku" => return Ok(()),
-        _ => {}
-    }
-    // Check for spaces (malformed)
     if trimmed.contains(' ') {
         return Err(format!(
-            "invalid model syntax: '{}' contains spaces. Use provider/model format or known alias",
+            "invalid model syntax: '{}' contains spaces",
             trimmed
         ));
     }
-    // Check provider/model format: provider_id/model_id
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-        return Err(format!(
-            "invalid model syntax: '{}'. Expected provider/model (e.g., anthropic/claude-opus-4-6) or known alias (opus, sonnet, haiku)",
-            trimmed
-        ));
+
+    fn is_valid_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':')
     }
-    Ok(())
+
+    if let Some((provider, model_id)) = trimmed.split_once('/') {
+        if provider.is_empty()
+            || model_id.is_empty()
+            || model_id.contains('/')
+            || !provider.chars().all(is_valid_char)
+            || !model_id.chars().all(is_valid_char)
+        {
+            return Err(format!(
+                "invalid model syntax: '{}'. Expected provider/model using letters, digits, '.', '-', '_', ':'",
+                trimmed
+            ));
+        }
+        return Ok(());
+    }
+
+    if trimmed.chars().all(is_valid_char) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "invalid model syntax: '{}'. Use letters, digits, '.', '-', '_', ':'",
+        trimmed
+    ))
 }
 
 fn config_alias_for_current_dir(alias: &str) -> Option<String> {
     if alias.is_empty() {
         return None;
     }
+
     let cwd = env::current_dir().ok()?;
     let loader = ConfigLoader::default_for(&cwd);
     let config = loader.load().ok()?;
@@ -9738,6 +9753,22 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn validate_model_syntax_accepts_common_model_ids_and_aliases() {
+        assert!(crate::validate_model_syntax("grok").is_ok());
+        assert!(crate::validate_model_syntax("kimi").is_ok());
+        assert!(crate::validate_model_syntax("qwen-max").is_ok());
+        assert!(crate::validate_model_syntax("qwen2.5-coder:7b").is_ok());
+        assert!(crate::validate_model_syntax("openai/gpt-4.1-mini").is_ok());
+    }
+
+    #[test]
+    fn validate_model_syntax_rejects_spaces_and_malformed_provider_forms() {
+        assert!(crate::validate_model_syntax("bad model").is_err());
+        assert!(crate::validate_model_syntax("openai//gpt-4.1-mini").is_err());
+        assert!(crate::validate_model_syntax("openai/gpt/4.1").is_err());
     }
 
     #[test]

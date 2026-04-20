@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_NINEROUTER_BASE_URL: &str = "http://localhost:20128/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -41,11 +42,13 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const NINEROUTER_ENV_VARS: &[&str] = &["NINEROUTER_API_KEY"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+const NINEROUTER_MAX_REQUEST_BODY_BYTES: usize = OPENAI_MAX_REQUEST_BODY_BYTES; // 100MB
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -85,12 +88,28 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// 9router OpenAI-compatible endpoint profile.
+    ///
+    /// Uses dedicated env vars so users can keep 9router credentials and base
+    /// URL separate from generic OPENAI_* settings.
+    #[must_use]
+    pub const fn nine_router() -> Self {
+        Self {
+            provider_name: "9router",
+            api_key_env: "NINEROUTER_API_KEY",
+            base_url_env: "NINEROUTER_BASE_URL",
+            default_base_url: DEFAULT_NINEROUTER_BASE_URL,
+            max_request_body_bytes: NINEROUTER_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "9router" => NINEROUTER_ENV_VARS,
             _ => &[],
         }
     }
