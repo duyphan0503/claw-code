@@ -9,9 +9,13 @@
 mod init;
 mod input;
 mod render;
+mod tui;
+mod tui_command_router;
+mod tui_constants;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
@@ -23,11 +27,14 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use chrono::{DateTime, Local};
+
 use api::{
     detect_provider_kind, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    OpenAiCompatConfig, OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient,
+    ProviderKind, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
+    ToolResultContentBlock,
 };
 
 use commands::{
@@ -55,9 +62,10 @@ use serde_json::{json, Map, Value};
 use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
+use tui::{McpStatus, Role as TuiRole, TuiApp, TuiOutcome};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-fn max_tokens_for_model(model: &str) -> u32 {
+pub(crate) fn max_tokens_for_model(model: &str) -> u32 {
     if model.contains("opus") {
         32_000
     } else {
@@ -1116,7 +1124,230 @@ fn resolve_repl_model(cli_model: String) -> String {
     cli_model
 }
 
-fn provider_label(kind: ProviderKind) -> &'static str {
+#[derive(Debug, Clone, Copy)]
+struct NineRouterModelUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cost_usd: f64,
+    total_tokens_all_models: u32,
+}
+
+fn env_var_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn looks_like_ninerouter_base_url(base_url: &str) -> bool {
+    let normalized = base_url.to_ascii_lowercase();
+    normalized.contains("9router") || normalized.contains("localhost:20128")
+}
+
+fn resolve_ninerouter_connection() -> Option<(String, String)> {
+    let ninerouter_base = env_var_non_empty("NINEROUTER_BASE_URL").unwrap_or_else(|| {
+        OpenAiCompatConfig::nine_router()
+            .default_base_url
+            .to_string()
+    });
+    if let Some(api_key) = env_var_non_empty("NINEROUTER_API_KEY") {
+        return Some((ninerouter_base, api_key));
+    }
+
+    let openai_base = env_var_non_empty("OPENAI_BASE_URL")
+        .unwrap_or_else(|| OpenAiCompatConfig::openai().default_base_url.to_string());
+    if looks_like_ninerouter_base_url(&openai_base) {
+        env_var_non_empty("OPENAI_API_KEY").map(|api_key| (openai_base, api_key))
+    } else {
+        None
+    }
+}
+
+fn ninerouter_models_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{trimmed}/models")
+    } else {
+        format!("{trimmed}/v1/models")
+    }
+}
+
+fn ninerouter_usage_stats_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{root}/api/usage/stats?period=7d")
+}
+
+fn parse_u32(value: Option<&Value>) -> Option<u32> {
+    let value = value?;
+    value
+        .as_u64()
+        .and_then(|raw| u32::try_from(raw).ok())
+        .or_else(|| {
+            value.as_f64().and_then(|raw| {
+                if raw.is_finite() && raw >= 0.0 && raw <= f64::from(u32::MAX) {
+                    let rounded = raw.round();
+                    format!("{rounded:.0}").parse::<u32>().ok()
+                } else {
+                    None
+                }
+            })
+        })
+}
+
+fn parse_f64(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    value.as_f64().or_else(|| {
+        value
+            .as_u64()
+            .and_then(|raw| raw.to_string().parse::<f64>().ok())
+    })
+}
+
+fn normalize_ninerouter_model_name(model: &str) -> &str {
+    model.strip_prefix("9router/").unwrap_or(model)
+}
+
+pub(crate) fn fetch_ninerouter_models() -> Result<Vec<(String, String)>, String> {
+    let Some((base_url, api_key)) = resolve_ninerouter_connection() else {
+        return Ok(Vec::new());
+    };
+    let endpoint = ninerouter_models_endpoint(&base_url);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create async runtime: {error}"))?;
+
+    let payload = runtime.block_on(async {
+        let client = api::build_http_client_or_default();
+        let response = client
+            .get(&endpoint)
+            .bearer_auth(api_key)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|error| format!("failed to request 9router models: {error}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("failed to read 9router models response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "9router models endpoint returned {status}: {}",
+                body.trim()
+            ));
+        }
+        serde_json::from_str::<Value>(&body)
+            .map_err(|error| format!("failed to parse 9router models JSON: {error}"))
+    })?;
+
+    let models = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .map_or_else(Vec::new, |items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let id = item.get("id").and_then(Value::as_str)?.trim().to_string();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    let owner = item
+                        .get("owned_by")
+                        .and_then(Value::as_str)
+                        .unwrap_or("9router");
+                    Some((id, format!("via {owner}")))
+                })
+                .collect::<Vec<_>>()
+        });
+
+    Ok(models)
+}
+
+fn fetch_ninerouter_usage_for_model(model: &str) -> Result<Option<NineRouterModelUsage>, String> {
+    let Some((base_url, api_key)) = resolve_ninerouter_connection() else {
+        return Ok(None);
+    };
+    let endpoint = ninerouter_usage_stats_endpoint(&base_url);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create async runtime: {error}"))?;
+
+    let payload = runtime.block_on(async {
+        let client = api::build_http_client_or_default();
+        let response = client
+            .get(&endpoint)
+            .bearer_auth(api_key)
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(|error| format!("failed to request 9router usage stats: {error}"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| format!("failed to read 9router usage response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!(
+                "9router usage endpoint returned {status}: {}",
+                body.trim()
+            ));
+        }
+        serde_json::from_str::<Value>(&body)
+            .map_err(|error| format!("failed to parse 9router usage JSON: {error}"))
+    })?;
+
+    let total_prompt = parse_u32(payload.get("totalPromptTokens")).unwrap_or(0);
+    let total_completion = parse_u32(payload.get("totalCompletionTokens")).unwrap_or(0);
+    let total_tokens_all = total_prompt.saturating_add(total_completion);
+    let target_model = normalize_ninerouter_model_name(model);
+
+    let by_model = payload.get("byModel").and_then(Value::as_object);
+    let mut prompt_tokens = total_prompt;
+    let mut completion_tokens = total_completion;
+    let mut cost_usd = parse_f64(payload.get("totalCost")).unwrap_or(0.0);
+
+    if let Some(entries) = by_model {
+        for (model_key, model_value) in entries {
+            let raw_model = model_value
+                .get("rawModel")
+                .and_then(Value::as_str)
+                .unwrap_or(model_key);
+            let normalized_raw = raw_model.split(" (").next().map_or(raw_model, str::trim);
+            if normalized_raw == target_model {
+                prompt_tokens = parse_u32(model_value.get("promptTokens")).unwrap_or(0);
+                completion_tokens = parse_u32(model_value.get("completionTokens")).unwrap_or(0);
+                cost_usd = parse_f64(model_value.get("cost")).unwrap_or(0.0);
+                break;
+            }
+        }
+    }
+
+    Ok(Some(NineRouterModelUsage {
+        prompt_tokens,
+        completion_tokens,
+        cost_usd,
+        total_tokens_all_models: total_tokens_all,
+    }))
+}
+
+fn provider_label(kind: ProviderKind, model: &str) -> &'static str {
+    if model.trim_start().starts_with("9router/") {
+        return "9router";
+    }
+
+    if resolve_ninerouter_connection().is_some() && kind == ProviderKind::OpenAi {
+        let normalized = model.trim_start();
+        if !normalized.starts_with("openai/")
+            && !normalized.starts_with("qwen/")
+            && !normalized.starts_with("qwen-")
+        {
+            return "9router";
+        }
+    }
+
     match kind {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Xai => "xai",
@@ -1125,7 +1356,7 @@ fn provider_label(kind: ProviderKind) -> &'static str {
 }
 
 fn format_connected_line(model: &str) -> String {
-    let provider = provider_label(detect_provider_kind(model));
+    let provider = provider_label(detect_provider_kind(model), model);
     format!("Connected: {model} via {provider}")
 }
 
@@ -3052,6 +3283,49 @@ fn run_repl(
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if we should use TUI mode - if stdin is a terminal and no specific mode is forced
+    if std::io::stdin().is_terminal() {
+        // Try to initialize and run TUI mode
+        if let Ok(mut tui_app) = TuiApp::new() {
+            // Resolve model first
+            let resolved_model = resolve_repl_model(model.clone());
+
+            // Create LiveCli ONCE and keep it alive throughout TUI session
+            let mut cli = LiveCli::new(
+                resolved_model.clone(),
+                true,
+                allowed_tools.clone(),
+                permission_mode,
+            )?;
+            cli.set_reasoning_effort(reasoning_effort.clone());
+
+            // Update TUI with actual data from CLI
+            cli.refresh_tui_dashboard(&mut tui_app, &resolved_model);
+
+            // Add slash command completions to the TUI
+            let completions = slash_command_completion_candidates_with_sessions(
+                &resolved_model,
+                None,
+                Vec::new(),
+            );
+            tui_app.set_completions(completions);
+
+            // Run TUI ONCE - it will handle everything internally and only return on exit
+            match tui_app.run_interactive_with_cli(&mut cli, &resolved_model)? {
+                TuiOutcome::Exit => {
+                    // Persist session before exiting
+                    cli.persist_session()?;
+                    std::process::exit(0);
+                }
+                TuiOutcome::Submit(_) => {
+                    // This should never happen now - TUI handles everything internally
+                    cli.persist_session()?;
+                }
+            }
+        }
+    }
+
+    // Fallback to the old readline-based REPL if TUI is not available or fails
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
@@ -3617,6 +3891,123 @@ impl HookAbortMonitor {
 }
 
 impl LiveCli {
+    fn refresh_tui_dashboard(&self, tui_app: &mut TuiApp, model: &str) {
+        let usage = self.runtime.usage().cumulative_usage();
+        let estimated_cost = usage
+            .estimate_cost_usd_with_pricing(
+                pricing_for_model(model).unwrap_or_else(runtime::ModelPricing::default_sonnet_tier),
+            )
+            .total_cost_usd();
+
+        let mut input_tokens = usage.input_tokens;
+        let mut output_tokens = usage.output_tokens;
+        let mut cost = estimated_cost;
+        let mut token_limit = max_tokens_for_model(model);
+
+        if provider_label(detect_provider_kind(model), model) == "9router" {
+            match fetch_ninerouter_usage_for_model(model) {
+                Ok(Some(remote_usage)) => {
+                    input_tokens = remote_usage.prompt_tokens;
+                    output_tokens = remote_usage.completion_tokens;
+                    cost = remote_usage.cost_usd;
+                    let total_tokens = remote_usage.total_tokens_all_models;
+                    if total_tokens > 0 {
+                        token_limit = total_tokens;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to refresh 9router usage stats for {model}: {error}; using local estimates"
+                    );
+                }
+            }
+        }
+
+        let message_count = self.runtime.session().messages.len();
+
+        tui_app.update_from_cli(model, &self.session.id, message_count);
+        tui_app.update_session_info(message_count, input_tokens, output_tokens, cost);
+        tui_app.update_usage(input_tokens, output_tokens, cost);
+        tui_app.update_session_created_at(self.session_started_at_label());
+        tui_app.update_permissions(
+            self.permission_mode.as_str(),
+            permission_risk_level(self.permission_mode),
+            permission_approval_label(self.permission_mode),
+        );
+        tui_app.set_token_limit(token_limit);
+        tui_app.set_mcp_statuses(self.mcp_statuses());
+        tui_app.set_lsps(self.lsp_names());
+        tui_app.detect_git_status();
+    }
+
+    fn mcp_statuses(&self) -> Vec<McpStatus> {
+        let Some(mcp_state) = &self.runtime.mcp_state else {
+            return Vec::new();
+        };
+
+        let state = mcp_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut statuses = std::collections::BTreeMap::<String, String>::new();
+        for server in state.server_names() {
+            statuses.insert(server, "connected".to_string());
+        }
+
+        if let Some(report) = state.degraded_report() {
+            for failed in report.failed_servers {
+                statuses.insert(failed.server_name, format!("error ({})", failed.phase));
+            }
+        }
+
+        if let Some(pending) = state.pending_servers() {
+            for server in pending {
+                statuses
+                    .entry(server)
+                    .or_insert_with(|| "pending".to_string());
+            }
+        }
+
+        statuses
+            .into_iter()
+            .map(|(name, status)| McpStatus { name, status })
+            .collect()
+    }
+
+    fn session_started_at_label(&self) -> String {
+        let timestamp = fs::metadata(&self.session.path)
+            .ok()
+            .and_then(|metadata| metadata.created().ok().or_else(|| metadata.modified().ok()));
+
+        timestamp.map_or_else(
+            || "Unavailable".to_string(),
+            |value| {
+                let local_time: DateTime<Local> = DateTime::<Local>::from(value);
+                local_time.format("%b %e · %H:%M").to_string()
+            },
+        )
+    }
+
+    fn mcp_server_names(&self) -> Vec<String> {
+        if let Some(mcp_state) = &self.runtime.mcp_state {
+            let state = mcp_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.manager.server_names()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn lsp_names(&self) -> Vec<String> {
+        tools::global_lsp_registry()
+            .list_servers()
+            .into_iter()
+            .map(|s| format!("{} ({})", s.language, s.status))
+            .collect()
+    }
+
     fn new(
         model: String,
         enable_tools: bool,
@@ -3965,8 +4356,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Stats => {
-                let usage = UsageTracker::from_session(self.runtime.session()).cumulative_usage();
-                println!("{}", format_cost_report(usage));
+                println!("{}", self.render_cost_report());
                 false
             }
             SlashCommand::Login
@@ -4019,28 +4409,37 @@ impl LiveCli {
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if !session_has_messages(self.runtime.session()) {
+            return Ok(());
+        }
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
     }
 
     fn print_status(&self) {
+        match self.render_status_report() {
+            Ok(report) => println!("{report}"),
+            Err(error) => eprintln!("failed to render status report: {error}"),
+        }
+    }
+
+    fn render_status_report(&self) -> Result<String, Box<dyn std::error::Error>> {
         let cumulative = self.runtime.usage().cumulative_usage();
         let latest = self.runtime.usage().current_turn_usage();
-        println!(
-            "{}",
-            format_status_report(
-                &self.model,
-                StatusUsage {
-                    message_count: self.runtime.session().messages.len(),
-                    turns: self.runtime.usage().turns(),
-                    latest,
-                    cumulative,
-                    estimated_tokens: self.runtime.estimated_tokens(),
-                },
-                self.permission_mode.as_str(),
-                &status_context(Some(&self.session.path)).expect("status context should load"),
-            )
-        );
+        let usage = StatusUsage {
+            message_count: self.runtime.session().messages.len(),
+            turns: self.runtime.usage().turns(),
+            latest,
+            cumulative,
+            estimated_tokens: self.runtime.estimated_tokens(),
+        };
+        let context = status_context(Some(&self.session.path))?;
+        Ok(format_status_report(
+            &self.model,
+            usage,
+            self.permission_mode.as_str(),
+            &context,
+        ))
     }
 
     fn record_prompt_history(&mut self, prompt: &str) {
@@ -4155,16 +4554,15 @@ impl LiveCli {
         Ok(true)
     }
 
-    fn set_permissions(
+    fn set_permissions_result(
         &mut self,
         mode: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<(bool, String), Box<dyn std::error::Error>> {
         let Some(mode) = mode else {
-            println!(
-                "{}",
-                format_permissions_report(self.permission_mode.as_str())
-            );
-            return Ok(false);
+            return Ok((
+                false,
+                format_permissions_report(self.permission_mode.as_str()),
+            ));
         };
 
         let normalized = normalize_permission_mode(&mode).ok_or_else(|| {
@@ -4174,8 +4572,7 @@ impl LiveCli {
         })?;
 
         if normalized == self.permission_mode.as_str() {
-            println!("{}", format_permissions_report(normalized));
-            return Ok(false);
+            return Ok((false, format_permissions_report(normalized)));
         }
 
         let previous = self.permission_mode.as_str().to_string();
@@ -4193,11 +4590,27 @@ impl LiveCli {
             None,
         )?;
         self.replace_runtime(runtime)?;
-        println!(
-            "{}",
-            format_permissions_switch_report(&previous, normalized)
-        );
-        Ok(true)
+
+        Ok((
+            true,
+            format_permissions_switch_report(&previous, normalized),
+        ))
+    }
+
+    fn set_permissions(
+        &mut self,
+        mode: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let (changed, report) = self.set_permissions_result(mode)?;
+        println!("{report}");
+        Ok(changed)
+    }
+
+    pub(crate) fn set_permissions_for_tui(
+        &mut self,
+        mode: Option<String>,
+    ) -> Result<(bool, String), Box<dyn std::error::Error>> {
+        self.set_permissions_result(mode)
     }
 
     fn clear_session(&mut self, confirm: bool) -> Result<bool, Box<dyn std::error::Error>> {
@@ -4236,8 +4649,12 @@ impl LiveCli {
     }
 
     fn print_cost(&self) {
+        println!("{}", self.render_cost_report());
+    }
+
+    fn render_cost_report(&self) -> String {
         let cumulative = self.runtime.usage().cumulative_usage();
-        println!("{}", format_cost_report(cumulative));
+        format_cost_report(cumulative)
     }
 
     fn resume_session(
@@ -4395,15 +4812,28 @@ impl LiveCli {
         action: Option<&str>,
         target: Option<&str>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
+        let (should_persist, message) = self.handle_session_command_result(action, target)?;
+        if let Some(message) = message {
+            println!("{message}");
+        }
+        Ok(should_persist)
+    }
+
+    pub(crate) fn handle_session_command_result(
+        &mut self,
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(bool, Option<String>), Box<dyn std::error::Error>> {
         match action {
             None | Some("list") => {
-                println!("{}", render_session_list(&self.session.id)?);
-                Ok(false)
+                Ok((false, Some(render_session_list(&self.session.id)?)))
             }
             Some("switch") => {
                 let Some(target) = target else {
-                    println!("Usage: /session switch <session-id>");
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        Some("Usage: /session switch <session-id>".to_string()),
+                    ));
                 };
                 let (handle, session) = load_session_reference(target)?;
                 let message_count = session.messages.len();
@@ -4424,13 +4854,15 @@ impl LiveCli {
                     id: session_id,
                     path: handle.path,
                 };
-                println!(
+                Ok((
+                    true,
+                    Some(format!(
                     "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
                     self.session.id,
                     self.session.path.display(),
                     message_count,
-                );
-                Ok(true)
+                )),
+                ))
             }
             Some("fork") => {
                 let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
@@ -4456,67 +4888,82 @@ impl LiveCli {
                 )?;
                 self.replace_runtime(runtime)?;
                 self.session = handle;
-                println!(
+                Ok((
+                    true,
+                    Some(format!(
                     "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
                     parent_session_id,
                     self.session.id,
                     branch_name.as_deref().unwrap_or("(unnamed)"),
                     self.session.path.display(),
                     message_count,
-                );
-                Ok(true)
+                )),
+                ))
             }
             Some("delete") => {
                 let Some(target) = target else {
-                    println!("Usage: /session delete <session-id> [--force]");
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        Some("Usage: /session delete <session-id> [--force]".to_string()),
+                    ));
                 };
                 let handle = resolve_session_reference(target)?;
                 if handle.id == self.session.id {
-                    println!(
-                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        Some(format!(
+                            "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
+                            handle.id
+                        )),
+                    ));
                 }
                 if !confirm_session_deletion(&handle.id) {
-                    println!("delete: cancelled.");
-                    return Ok(false);
+                    return Ok((false, Some("delete: cancelled.".to_string())));
                 }
                 delete_managed_session(&handle.path)?;
-                println!(
-                    "Session deleted\n  Deleted session  {}\n  File             {}",
-                    handle.id,
-                    handle.path.display(),
-                );
-                Ok(false)
+                Ok((
+                    false,
+                    Some(format!(
+                        "Session deleted\n  Deleted session  {}\n  File             {}",
+                        handle.id,
+                        handle.path.display(),
+                    )),
+                ))
             }
             Some("delete-force") => {
                 let Some(target) = target else {
-                    println!("Usage: /session delete <session-id> [--force]");
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        Some("Usage: /session delete <session-id> [--force]".to_string()),
+                    ));
                 };
                 let handle = resolve_session_reference(target)?;
                 if handle.id == self.session.id {
-                    println!(
-                        "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
-                        handle.id
-                    );
-                    return Ok(false);
+                    return Ok((
+                        false,
+                        Some(format!(
+                            "delete: refusing to delete the active session '{}'.\nSwitch to another session first with /session switch <session-id>.",
+                            handle.id
+                        )),
+                    ));
                 }
                 delete_managed_session(&handle.path)?;
-                println!(
-                    "Session deleted\n  Deleted session  {}\n  File             {}",
-                    handle.id,
-                    handle.path.display(),
-                );
-                Ok(false)
+                Ok((
+                    false,
+                    Some(format!(
+                        "Session deleted\n  Deleted session  {}\n  File             {}",
+                        handle.id,
+                        handle.path.display(),
+                    )),
+                ))
             }
             Some(other) => {
-                println!(
-                    "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
-                );
-                Ok(false)
+                Ok((
+                    false,
+                    Some(format!(
+                        "Unknown /session action '{other}'. Use /session list, /session switch <session-id>, /session fork [branch-name], or /session delete <session-id> [--force]."
+                    )),
+                ))
             }
         }
     }
@@ -4665,6 +5112,30 @@ impl LiveCli {
     }
 }
 
+fn session_has_messages(session: &Session) -> bool {
+    !session.messages.is_empty()
+}
+
+fn permission_risk_level(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::ReadOnly => "Low · read surface only",
+        PermissionMode::WorkspaceWrite => "Medium · workspace writes",
+        PermissionMode::DangerFullAccess => "High · unrestricted tools",
+        PermissionMode::Prompt => "Medium · prompt-gated tools",
+        PermissionMode::Allow => "Low · allowlisted policy",
+    }
+}
+
+fn permission_approval_label(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::ReadOnly | PermissionMode::WorkspaceWrite | PermissionMode::Prompt => {
+            "Interactive approval"
+        }
+        PermissionMode::Allow => "Approved by policy",
+        PermissionMode::DangerFullAccess => "Bypassed in session",
+    }
+}
+
 fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(current_session_store()?.sessions_dir().to_path_buf())
 }
@@ -4717,6 +5188,32 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             message_count: session.message_count,
             parent_session_id: session.parent_session_id,
             branch_name: session.branch_name,
+        })
+        .collect())
+}
+
+pub(crate) fn list_managed_sessions_for_tui(
+    active_session_id: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let sessions = list_managed_sessions().map_err(|error| error.to_string())?;
+    Ok(sessions
+        .into_iter()
+        .map(|session| {
+            let mut details = format!(
+                "{} msgs · {}",
+                session.message_count,
+                format_session_modified_age(session.modified_epoch_millis)
+            );
+            if session.id == active_session_id {
+                details.push_str(" · current");
+            }
+            if let Some(branch_name) = &session.branch_name {
+                let _ = write!(details, " · branch={branch_name}");
+            }
+            if let Some(parent) = &session.parent_session_id {
+                let _ = write!(details, " · from={parent}");
+            }
+            (session.id, details)
         })
         .collect())
 }
@@ -4962,7 +5459,11 @@ fn status_context(
 ) -> Result<StatusContext, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
-    let discovered_config_files = loader.discover().len();
+    let discovered_config_files = loader
+        .discover()
+        .into_iter()
+        .filter(|entry| entry.source != ConfigSource::User)
+        .count();
     let runtime_config = loader.load()?;
     let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
@@ -4972,7 +5473,11 @@ fn status_context(
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
-        loaded_config_files: runtime_config.loaded_entries().len(),
+        loaded_config_files: runtime_config
+            .loaded_entries()
+            .iter()
+            .filter(|entry| entry.source != ConfigSource::User)
+            .count(),
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
         project_root,
@@ -8290,7 +8795,7 @@ mod tests {
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        resume_supported_slash_commands, run_resume_command, session_has_messages, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, try_resolve_bare_skill_prompt, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
@@ -8382,6 +8887,18 @@ mod tests {
         assert!(rendered.contains("provider_retry_exhausted"), "{rendered}");
         assert!(rendered.contains("session session-issue-22"));
         assert!(rendered.contains("trace req_jobdori_790"));
+    }
+
+    #[test]
+    fn session_has_messages_requires_at_least_one_message() {
+        let empty = Session::new();
+        assert!(!session_has_messages(&empty));
+
+        let mut with_message = Session::new();
+        with_message
+            .messages
+            .push(ConversationMessage::user_text("hello"));
+        assert!(session_has_messages(&with_message));
     }
 
     #[test]
@@ -9913,7 +10430,7 @@ mod tests {
         assert!(help.contains("/cost"));
         assert!(help.contains("/resume <session-path>"));
         assert!(help.contains("/config [env|hooks|model|plugins]"));
-        assert!(help.contains("/mcp [list|show <server>|help]"));
+        assert!(help.contains("/mcp [list|show <server>|gitnexus [install]|help]"));
         assert!(help.contains("/memory"));
         assert!(help.contains("/init"));
         assert!(help.contains("/diff"));
@@ -9992,6 +10509,15 @@ mod tests {
         let line = format_connected_line(model);
 
         assert_eq!(line, "Connected: grok-3 via xai");
+    }
+
+    #[test]
+    fn format_connected_line_renders_9router_provider_for_prefixed_model() {
+        let model = "9router/deepseek-chat";
+
+        let line = format_connected_line(model);
+
+        assert_eq!(line, "Connected: 9router/deepseek-chat via 9router");
     }
 
     #[test]
@@ -10598,6 +11124,57 @@ UU conflicted.rs",
                 .canonicalize()
                 .expect("resolved path should exist"),
             newer.path.canonicalize().expect("newer path should exist")
+        );
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn list_managed_sessions_for_tui_marks_current_session() {
+        let _guard = cwd_guard();
+        let workspace = temp_workspace("tui-session-list");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let current = create_managed_session_handle("session-current").expect("current handle");
+        Session::new()
+            .with_persistence_path(current.path.clone())
+            .save_to_path(&current.path)
+            .expect("current session should save");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let other = create_managed_session_handle("session-other").expect("other handle");
+        Session::new()
+            .with_persistence_path(other.path.clone())
+            .save_to_path(&other.path)
+            .expect("other session should save");
+
+        let summaries = crate::list_managed_sessions().expect("managed sessions should load");
+        let active_id = summaries
+            .iter()
+            .find(|summary| summary.path == current.path)
+            .map(|summary| summary.id.clone())
+            .expect("active session id should resolve from current handle path");
+        let other_id = summaries
+            .iter()
+            .find(|summary| summary.path == other.path)
+            .map(|summary| summary.id.clone())
+            .expect("secondary session id should resolve from other handle path");
+
+        let sessions = crate::list_managed_sessions_for_tui(&active_id)
+            .expect("tui session helper should return sessions");
+
+        assert!(
+            sessions
+                .iter()
+                .any(|(id, details)| { id == &active_id && details.contains("current") }),
+            "current session marker missing: {sessions:?}"
+        );
+        assert!(
+            sessions.iter().any(|(id, _)| id == &other_id),
+            "expected secondary session in list: {sessions:?}"
         );
 
         std::env::set_current_dir(previous).expect("restore cwd");
